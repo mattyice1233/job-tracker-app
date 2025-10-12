@@ -1,0 +1,15 @@
+{
+  "model_type": "bert",
+  "architectures": ["BertForTokenClassification"],
+  "num_labels": 3,
+  "id2label": {
+    "0": "O",
+    "1": "COMPANY",
+    "2": "POSITION"
+  },
+  "label2id": {
+    "O": 0,
+    "COMPANY": 1,
+    "POSITION": 2
+  }
+}
