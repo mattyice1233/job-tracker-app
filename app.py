@@ -1,5 +1,5 @@
-# app.py - Fixed version that properly mirrors your working scripts
-from flask import Flask, jsonify, session, request, redirect
+# app.py - Uses Hugging Face Inference API (no local model loading)
+from flask import Flask, jsonify, session, request, redirect, send_from_directory
 from flask_cors import CORS
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
@@ -16,17 +16,7 @@ from bs4 import BeautifulSoup
 import html
 import time
 import re
-from flask import Flask, send_from_directory
-import os
-import os
-from flask import Flask, jsonify, session, request, redirect, send_from_directory
-
-# Import transformers for models
-from transformers import (
-    AutoTokenizer, AutoModelForTokenClassification,
-    pipeline
-)
-import torch
+import requests  # For HF API calls
 
 # Load environment variables
 load_dotenv()
@@ -34,9 +24,17 @@ load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'dev-secret-key-for-job-tracker')
 
-# CORS configuration
+# Update CORS for production
+if os.getenv('RENDER'):
+    ALLOWED_ORIGINS = [
+        "https://job-tracker-app-gv0b.onrender.com",  # Update with your Render URL
+        "http://localhost:3000"
+    ]
+else:
+    ALLOWED_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
 CORS(app, 
-     origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+     origins=ALLOWED_ORIGINS,
      supports_credentials=True)
 
 # OAuth Configuration
@@ -51,54 +49,38 @@ DATA_DIR = 'user_data'
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
-# Global variables for models (loaded once at startup)
-classifier_model = None
-ner_model = None
-ner_tokenizer = None
-ner_pipeline = None
+# Hugging Face API Configuration
+HF_TOKEN = os.getenv('HUGGINGFACE_TOKEN')
+HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
+# API URLs for your models
+CLASSIFIER_API = "https://api-inference.huggingface.co/models/Minaides/job-email-classifier"
+NER_API = "https://api-inference.huggingface.co/models/Minaides/job_ner_model"
 
-#here
 def load_models():
-    """Load AI models from Hugging Face Hub."""
-    global classifier_model, ner_model, ner_tokenizer, ner_pipeline
+    """Initialize - no actual model loading, just verify API access"""
+    print("✅ Using Hugging Face Inference API - no local models loaded")
+    print(f"📡 Classifier API: {CLASSIFIER_API}")
+    print(f"📡 NER API: {NER_API}")
     
+    # Test API connectivity
     try:
-        # Load classifier directly from Hugging Face Hub
-        print("🌐 Loading email classifier from Hugging Face...")
-        classifier_model = pipeline(
-            "text-classification",
-            model="Minaides/job-email-classifier",  # Hugging Face repo
-            device=-1  # CPU
+        test_response = requests.post(
+            CLASSIFIER_API, 
+            headers=HEADERS, 
+            json={"inputs": "test"}, 
+            timeout=10
         )
-        print("✅ Classifier loaded successfully from Hugging Face!")
+        if test_response.status_code == 503:
+            print("⚠️ Models are loading on HF servers, first calls may be slower")
+        elif test_response.status_code == 200:
+            print("✅ Classifier API is ready")
+        else:
+            print(f"⚠️ Classifier API status: {test_response.status_code}")
     except Exception as e:
-        print(f"⚠️ Warning: Could not load classifier: {e}")
-        classifier_model = None
-    
-    try:
-        # Load NER model directly from Hugging Face Hub
-        print("🌐 Loading NER model from Hugging Face...")
-        model_path = "Minaides/job_ner_model"
-        
-        ner_tokenizer = AutoTokenizer.from_pretrained(model_path, use_auth_token=True)
-        ner_model = AutoModelForTokenClassification.from_pretrained(model_path, use_auth_token=True)
-        
-        ner_pipeline = pipeline(
-            "ner",
-            model=ner_model,
-            tokenizer=ner_tokenizer,
-            aggregation_strategy="simple",
-            device=-1  # CPU
-        )
-        print("✅ NER model loaded successfully from Hugging Face!")
-    except Exception as e:
-        print(f"⚠️ Warning: Could not load NER model: {e}")
-        ner_pipeline = None
+        print(f"⚠️ Could not reach HF API: {e}")
 
-#to here
-
-# Load models at startup
+# Initialize on startup
 load_models()
 
 def get_client_config():
@@ -121,7 +103,7 @@ def get_user_data_file():
     return os.path.join(DATA_DIR, f'{user_id}_results.json')
 
 def clean_email_body(text):
-    """Clean and normalize email body text - from job-fetcher.py"""
+    """Clean and normalize email body text"""
     if not text:
         return ""
     
@@ -142,7 +124,7 @@ def clean_email_body(text):
     return text
 
 def fetch_email(service, msg_id, max_retries=4):
-    """Fetch email metadata + body - from job-fetcher.py"""
+    """Fetch email metadata + body"""
     attempt = 0
     wait = 1
     while attempt < max_retries:
@@ -203,28 +185,75 @@ def fetch_email(service, msg_id, max_retries=4):
     return None
 
 def classify_emails(emails_df):
-    """Classify emails - exactly like test_classifier_on_emails.py"""
-    if classifier_model is None:
-        print("⚠️ Classifier not loaded, marking all as job applications")
-        emails_df['is_application'] = True
-        emails_df['confidence'] = 0.5
-        return emails_df
-    
-    print(f"📧 Classifying {len(emails_df)} emails...")
+    """Classify emails using HF Inference API"""
+    print(f"📧 Classifying {len(emails_df)} emails using HF API...")
     
     results = []
     for idx, row in emails_df.iterrows():
         email_text = f"Subject: {row['subject']}\n\n{row['body'][:1000]}"
         
         try:
-            classification = classifier_model(email_text)[0]
+            # Call HF Inference API
+            response = requests.post(
+                CLASSIFIER_API, 
+                headers=HEADERS,
+                json={"inputs": email_text},
+                timeout=30
+            )
             
-            results.append({
-                'gmail_id': row['gmail_id'],
-                'is_application': classification['label'] == 'JOB_APPLICATION',
-                'confidence': classification['score']
-            })
-            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Handle different response formats
+                if isinstance(data, list):
+                    # If it's a list of lists (multiple predictions)
+                    if data and isinstance(data[0], list):
+                        classification = data[0][0] if data[0] else {"label": "UNKNOWN", "score": 0.0}
+                    # If it's a list of dicts
+                    else:
+                        classification = data[0] if data else {"label": "UNKNOWN", "score": 0.0}
+                else:
+                    classification = data
+                
+                results.append({
+                    'gmail_id': row['gmail_id'],
+                    'is_application': classification.get('label') == 'JOB_APPLICATION',
+                    'confidence': float(classification.get('score', 0.0))
+                })
+                
+            elif response.status_code == 503:
+                # Model is loading
+                print(f"Model loading, retrying in 20s...")
+                time.sleep(20)
+                # Retry once
+                retry_response = requests.post(
+                    CLASSIFIER_API, 
+                    headers=HEADERS,
+                    json={"inputs": email_text},
+                    timeout=30
+                )
+                if retry_response.status_code == 200:
+                    data = retry_response.json()
+                    classification = data[0] if isinstance(data, list) and data else data
+                    results.append({
+                        'gmail_id': row['gmail_id'],
+                        'is_application': classification.get('label') == 'JOB_APPLICATION',
+                        'confidence': float(classification.get('score', 0.0))
+                    })
+                else:
+                    results.append({
+                        'gmail_id': row['gmail_id'],
+                        'is_application': False,
+                        'confidence': 0.0
+                    })
+            else:
+                print(f"API error {response.status_code}: {response.text[:200]}")
+                results.append({
+                    'gmail_id': row['gmail_id'],
+                    'is_application': False,
+                    'confidence': 0.0
+                })
+                
             if idx % 10 == 0:
                 print(f"Classified {idx}/{len(emails_df)}...")
                 
@@ -246,49 +275,107 @@ def classify_emails(emails_df):
     return emails_df
 
 def extract_job_info(emails_df):
-    """Extract company and position - exactly like 5_inference.py"""
-    if ner_pipeline is None:
-        print("⚠️ NER model not loaded, skipping extraction")
-        emails_df['company'] = None
-        emails_df['position'] = None
-        return emails_df
-    
-    print(f"🔍 Extracting job information from {len(emails_df)} emails...")
+    """Extract job info using HF Inference API"""
+    print(f"🔍 Extracting job information from {len(emails_df)} emails using HF API...")
     
     results = []
     for idx, row in emails_df.iterrows():
-        if idx % 10 == 0:
-            print(f"Processed {idx}/{len(emails_df)} emails...")
-        
-        # Combine subject and body for context
         full_text = f"Subject: {row['subject']}\n\n{row['body'][:2000]}"
         
         try:
-            # Run NER
-            entities = ner_pipeline(full_text)
+            # Call HF Inference API for NER
+            response = requests.post(
+                NER_API,
+                headers=HEADERS,
+                json={"inputs": full_text},
+                timeout=60
+            )
             
-            # Group entities by type
-            companies = []
-            positions = []
-            
-            for entity in entities:
-                if entity['entity_group'] == 'COMPANY':
-                    companies.append(entity['word'].strip())
-                elif entity['entity_group'] == 'POSITION':
-                    positions.append(entity['word'].strip())
-            
-            # Clean and deduplicate
-            companies = list(dict.fromkeys([c for c in companies if len(c) > 2]))
-            positions = list(dict.fromkeys([p for p in positions if len(p) > 2]))
-            
-            results.append({
-                'gmail_id': row['gmail_id'],
-                'company': companies[0] if companies else None,
-                'position': positions[0] if positions else None,
-                'all_companies': companies,
-                'all_positions': positions
-            })
-            
+            if response.status_code == 200:
+                entities = response.json()
+                
+                companies = []
+                positions = []
+                
+                # Parse the NER results
+                for entity in entities:
+                    entity_group = entity.get('entity_group', '')
+                    word = entity.get('word', '').strip()
+                    
+                    # Handle both B-/I- prefixed and plain labels
+                    if 'COMPANY' in entity_group:
+                        companies.append(word)
+                    elif 'POSITION' in entity_group:
+                        positions.append(word)
+                
+                # Clean and deduplicate
+                companies = list(dict.fromkeys([c for c in companies if len(c) > 2]))
+                positions = list(dict.fromkeys([p for p in positions if len(p) > 2]))
+                
+                results.append({
+                    'gmail_id': row['gmail_id'],
+                    'company': companies[0] if companies else None,
+                    'position': positions[0] if positions else None,
+                    'all_companies': companies,
+                    'all_positions': positions
+                })
+                
+            elif response.status_code == 503:
+                # Model is loading
+                print(f"NER model loading, waiting 30s...")
+                time.sleep(30)
+                # Retry once
+                retry_response = requests.post(
+                    NER_API,
+                    headers=HEADERS,
+                    json={"inputs": full_text},
+                    timeout=60
+                )
+                if retry_response.status_code == 200:
+                    entities = retry_response.json()
+                    companies = []
+                    positions = []
+                    
+                    for entity in entities:
+                        entity_group = entity.get('entity_group', '')
+                        word = entity.get('word', '').strip()
+                        
+                        if 'COMPANY' in entity_group:
+                            companies.append(word)
+                        elif 'POSITION' in entity_group:
+                            positions.append(word)
+                    
+                    companies = list(dict.fromkeys([c for c in companies if len(c) > 2]))
+                    positions = list(dict.fromkeys([p for p in positions if len(p) > 2]))
+                    
+                    results.append({
+                        'gmail_id': row['gmail_id'],
+                        'company': companies[0] if companies else None,
+                        'position': positions[0] if positions else None,
+                        'all_companies': companies,
+                        'all_positions': positions
+                    })
+                else:
+                    results.append({
+                        'gmail_id': row['gmail_id'],
+                        'company': None,
+                        'position': None,
+                        'all_companies': [],
+                        'all_positions': []
+                    })
+            else:
+                print(f"NER API error {response.status_code}")
+                results.append({
+                    'gmail_id': row['gmail_id'],
+                    'company': None,
+                    'position': None,
+                    'all_companies': [],
+                    'all_positions': []
+                })
+                
+            if idx % 10 == 0:
+                print(f"Processed {idx}/{len(emails_df)} emails...")
+                
         except Exception as e:
             print(f"Error extracting from email: {e}")
             results.append({
@@ -308,38 +395,42 @@ def extract_job_info(emails_df):
     print(f"📊 Found {companies_found} companies and {positions_found} positions")
     
     return emails_df
-if os.getenv('RENDER'):
-    ALLOWED_ORIGINS = [
-        "https://your-app-name.onrender.com",
-        "http://localhost:3000"
-    ]
-else:
-    ALLOWED_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
 
-CORS(app, 
-     origins=ALLOWED_ORIGINS,
-     supports_credentials=True)
-@app.route('/')
-def home():
-    return jsonify({"message": "Job Application Tracker API - Running!"})
+# Serve React build files
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve(path):
+    # Skip API routes
+    if path.startswith('api/') or path.startswith('auth/'):
+        return jsonify({'error': 'Not found'}), 404
+    
+    build_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'build')
+    
+    if path != "" and os.path.exists(os.path.join(build_path, path)):
+        return send_from_directory(build_path, path)
+    else:
+        if os.path.exists(os.path.join(build_path, 'index.html')):
+            return send_from_directory(build_path, 'index.html')
+        else:
+            # If no build folder, return API status
+            return jsonify({"message": "Job Application Tracker API - Running!"})
 
 @app.route('/api/test')
 def test_api():
     return jsonify({'message': 'API is working!'})
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
-def serve(path):
-    if path != "" and os.path.exists(os.path.join('build', path)):
-        return send_from_directory('build', path)
-    else:
-        return send_from_directory('build', 'index.html')
+
 @app.route('/auth/url')
 def get_auth_url():
     try:
+        # Use production URL if on Render
+        redirect_uri = f'http://localhost:{BACKEND_PORT}/auth/callback'
+        if os.getenv('RENDER'):
+            redirect_uri = 'https://job-tracker-app-gv0b.onrender.com/auth/callback'
+        
         flow = Flow.from_client_config(
             get_client_config(),
             scopes=SCOPES,
-            redirect_uri=f'http://localhost:{BACKEND_PORT}/auth/callback'
+            redirect_uri=redirect_uri
         )
         
         authorization_url, state = flow.authorization_url(
@@ -361,12 +452,16 @@ def auth_callback():
         
         if not state:
             return redirect(f'{FRONTEND_URL}?auth=error&message=State missing')
+        
+        redirect_uri = f'http://localhost:{BACKEND_PORT}/auth/callback'
+        if os.getenv('RENDER'):
+            redirect_uri = 'https://job-tracker-app-gv0b.onrender.com/auth/callback'
             
         flow = Flow.from_client_config(
             get_client_config(),
             scopes=SCOPES,
             state=state,
-            redirect_uri=f'http://localhost:{BACKEND_PORT}/auth/callback'
+            redirect_uri=redirect_uri
         )
         
         flow.fetch_token(authorization_response=request.url)
@@ -387,14 +482,7 @@ def auth_callback():
         
     except Exception as e:
         return redirect(f'{FRONTEND_URL}?auth=error&message={str(e)}')
-# Add this route to serve React app
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
-def serve_react(path):
-    if path != "" and os.path.exists(os.path.join('build', path)):
-        return send_from_directory('build', path)
-    else:
-        return send_from_directory('build', 'index.html')
+
 @app.route('/auth/status')
 def auth_status():
     # Check if we have results file
@@ -404,8 +492,8 @@ def auth_status():
         'email_processing': session.get('email_processing', False),
         'has_results': has_results,
         'models_loaded': {
-            'classifier': classifier_model is not None,
-            'ner': ner_pipeline is not None
+            'classifier': True,  # Always true with API
+            'ner': True  # Always true with API
         }
     })
 
@@ -421,7 +509,7 @@ def process_emails():
         credentials = Credentials(**session['credentials'])
         service = build('gmail', 'v1', credentials=credentials)
         
-        # Build date range (one year ago -> today) - exactly like job-fetcher.py
+        # Build date range (one year ago -> today)
         today = datetime.today().date()
         one_year_ago = (today - timedelta(days=365)).strftime("%Y/%m/%d")
         tomorrow = (today + timedelta(days=1)).strftime("%Y/%m/%d")
@@ -474,14 +562,14 @@ def process_emails():
         emails_df = pd.DataFrame(emails)
         print(f"✅ Successfully fetched {len(emails_df)} emails")
         
-        # Step 1: Classify emails (like test_classifier_on_emails.py)
+        # Step 1: Classify emails
         emails_df = classify_emails(emails_df)
         
         # Filter to only job applications
         job_applications = emails_df[emails_df['is_application'] == True].copy()
         print(f"🎯 {len(job_applications)} emails classified as job applications")
         
-        # Step 2: Extract job info from applications only (like 5_inference.py)
+        # Step 2: Extract job info from applications only
         if len(job_applications) > 0:
             job_applications = extract_job_info(job_applications)
         
@@ -493,8 +581,8 @@ def process_emails():
             'stats': {
                 'total_emails': len(emails_df),
                 'job_applications': len(job_applications),
-                'companies_found': len(job_applications[job_applications['company'].notna()]),
-                'positions_found': len(job_applications[job_applications['position'].notna()])
+                'companies_found': len(job_applications[job_applications['company'].notna()]) if len(job_applications) > 0 else 0,
+                'positions_found': len(job_applications[job_applications['position'].notna()]) if len(job_applications) > 0 else 0
             }
         }
         
@@ -559,13 +647,12 @@ def clear_session():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
-    os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
-    print(f"🚀 Starting Job Tracker API on port {BACKEND_PORT}")
-    app.run(debug=True, port=int(BACKEND_PORT), host='0.0.0.0')
-if __name__ == '__main__':
     port = int(os.getenv('PORT', 5001))
     if os.getenv('RENDER'):
+        print(f"🚀 Starting Job Tracker API on Render (port {port})")
         app.run(host='0.0.0.0', port=port, debug=False)
     else:
+        print(f"🚀 Starting Job Tracker API locally (port {port})")
+        os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+        os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
         app.run(debug=True, port=port, host='0.0.0.0')
