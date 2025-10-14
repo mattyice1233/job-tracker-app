@@ -2,6 +2,7 @@ services:
   - type: web
     name: job-tracker
     runtime: python
+    pythonVersion: "3.11" 
     plan: free
     buildCommand: "pip install -r requirements.txt"
     startCommand: "gunicorn app:app --bind 0.0.0.0:$PORT"
