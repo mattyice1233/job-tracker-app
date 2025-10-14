@@ -396,7 +396,6 @@ def extract_job_info(emails_df):
     
     return emails_df
 
-# Serve React build files
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve(path):
@@ -404,13 +403,12 @@ def serve(path):
     if path.startswith('api/') or path.startswith('auth/'):
         return jsonify({'error': 'Not found'}), 404
     
-    build_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'build')
-    
-    if path != "" and os.path.exists(os.path.join(build_path, path)):
-        return send_from_directory(build_path, path)
+    # Use the static_folder we configured
+    if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
+        return send_from_directory(app.static_folder, path)
     else:
-        if os.path.exists(os.path.join(build_path, 'index.html')):
-            return send_from_directory(build_path, 'index.html')
+        if os.path.exists(os.path.join(app.static_folder, 'index.html')):
+            return send_from_directory(app.static_folder, 'index.html')
         else:
             # If no build folder, return API status
             return jsonify({"message": "Job Application Tracker API - Running!"})
