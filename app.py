@@ -27,7 +27,7 @@ app.secret_key = os.getenv('SECRET_KEY', 'dev-secret-key-for-job-tracker')
 # Update CORS for production
 if os.getenv('RENDER'):
     ALLOWED_ORIGINS = [
-        "https://job-tracker-app-gv0b.onrender.com",  # Update with your Render URL
+        "https://job-tracker-app-gv0b.onrender.com",
         "http://localhost:3000"
     ]
 else:
@@ -90,7 +90,10 @@ def get_client_config():
             "client_secret": GOOGLE_CLIENT_SECRET,
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [f"http://localhost:{BACKEND_PORT}/auth/callback"]
+            "redirect_uris": [
+                "https://job-tracker-app-gv0b.onrender.com/auth/callback",
+                f"http://localhost:{BACKEND_PORT}/auth/callback"
+            ]
         }
     }
 
