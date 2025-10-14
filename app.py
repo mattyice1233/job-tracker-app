@@ -21,7 +21,7 @@ import requests  # For HF API calls
 # Load environment variables
 load_dotenv()
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='frontend/build', static_url_path='/')
 app.secret_key = os.getenv('SECRET_KEY', 'dev-secret-key-for-job-tracker')
 
 # Update CORS for production
@@ -645,7 +645,17 @@ def clear_session():
         return jsonify({'message': 'Session and data cleared'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+# Serve React App
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve(path):
+    if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
+        return send_from_directory(app.static_folder, path)
+    else:
+        return send_from_directory(app.static_folder, 'index.html')
 
+if __name__ == '__main__':
+    app.run(debug=True, port=int(os.getenv('PORT', 5001)))
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5001))
     if os.getenv('RENDER'):
