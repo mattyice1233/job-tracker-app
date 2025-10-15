@@ -17,6 +17,7 @@ import html
 import time
 import re
 import requests  # For HF API calls
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Load environment variables
 load_dotenv()
@@ -192,216 +193,229 @@ def fetch_email(service, msg_id, max_retries=4):
 
     return None
 
-def classify_emails(emails_df):
-    """Classify emails using HF Zero-Shot Classification API"""
-    print(f"📧 Classifying {len(emails_df)} emails using HF API...")
+def classify_single_email(row, job_statuses):
+    """Classify a single email - helper for parallel processing"""
+    email_text = f"Subject: {row['subject']}\n\n{row['body'][:1000]}"
     
-    results = []
-    for idx, row in emails_df.iterrows():
-        email_text = f"Subject: {row['subject']}\n\n{row['body'][:1000]}"
+    try:
+        response = requests.post(
+            CLASSIFIER_API, 
+            headers=HEADERS,
+            json={
+                "inputs": email_text,
+                "parameters": {"candidate_labels": job_statuses}
+            },
+            timeout=30
+        )
         
-        try:
-            # Call HF Zero-Shot Classification API
-            response = requests.post(
+        if response.status_code == 200:
+            data = response.json()
+            top_label = data.get('labels', [''])[0]
+            confidence = data.get('scores', [0.0])[0]
+            is_app = top_label in ["application submitted", "job interview invitation", "job rejection"]
+            
+            return {
+                'gmail_id': row['gmail_id'],
+                'is_application': is_app,
+                'application_status': top_label if is_app else None,
+                'confidence': float(confidence)
+            }
+        elif response.status_code == 503:
+            time.sleep(20)
+            retry_response = requests.post(
                 CLASSIFIER_API, 
                 headers=HEADERS,
                 json={
                     "inputs": email_text,
-                    "parameters": {
-                        "candidate_labels": ["job application response", "recruitment marketing", "unrelated"]
-                    }
+                    "parameters": {"candidate_labels": job_statuses}
                 },
                 timeout=30
             )
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                # Zero-shot classifier returns {'labels': [...], 'scores': [...]}
-                # The first label is the highest confidence prediction
-                is_app = data.get('labels', [''])[0] == "job application response"
+            if retry_response.status_code == 200:
+                data = retry_response.json()
+                top_label = data.get('labels', [''])[0]
                 confidence = data.get('scores', [0.0])[0]
+                is_app = top_label in ["application submitted", "job interview invitation", "job rejection"]
                 
-                results.append({
+                return {
                     'gmail_id': row['gmail_id'],
                     'is_application': is_app,
+                    'application_status': top_label if is_app else None,
                     'confidence': float(confidence)
-                })
-                
-            elif response.status_code == 503:
-                # Model is loading
-                print(f"Model loading, retrying in 20s...")
-                time.sleep(20)
-                # Retry once
-                retry_response = requests.post(
-                    CLASSIFIER_API, 
-                    headers=HEADERS,
-                    json={
-                        "inputs": email_text,
-                        "parameters": {
-                            "candidate_labels": ["job application response", "recruitment marketing", "unrelated"]
-                        }
-                    },
-                    timeout=30
-                )
-                if retry_response.status_code == 200:
-                    data = retry_response.json()
-                    is_app = data.get('labels', [''])[0] == "job application response"
-                    confidence = data.get('scores', [0.0])[0]
-                    
-                    results.append({
-                        'gmail_id': row['gmail_id'],
-                        'is_application': is_app,
-                        'confidence': float(confidence)
-                    })
-                else:
-                    results.append({
-                        'gmail_id': row['gmail_id'],
-                        'is_application': False,
-                        'confidence': 0.0
-                    })
-            else:
-                print(f"API error {response.status_code}: {response.text[:200]}")
-                results.append({
-                    'gmail_id': row['gmail_id'],
-                    'is_application': False,
-                    'confidence': 0.0
-                })
-                
-            if idx % 10 == 0:
-                print(f"Classified {idx}/{len(emails_df)}...")
-                
-        except Exception as e:
-            print(f"Error classifying email: {e}")
-            results.append({
-                'gmail_id': row['gmail_id'],
-                'is_application': False,
-                'confidence': 0.0
-            })
+                }
+        
+        return {
+            'gmail_id': row['gmail_id'],
+            'is_application': False,
+            'application_status': None,
+            'confidence': 0.0
+        }
+    except Exception as e:
+        print(f"Error classifying email: {e}")
+        return {
+            'gmail_id': row['gmail_id'],
+            'is_application': False,
+            'application_status': None,
+            'confidence': 0.0
+        }
+
+def classify_emails(emails_df):
+    """Classify emails using HF Zero-Shot Classification API with parallel processing"""
+    print(f"📧 Classifying {len(emails_df)} emails using HF API (parallel)...")
+    
+    # Define the 4 status types
+    JOB_STATUSES = ["application submitted", "job interview invitation", "job rejection", "other"]
+    
+    results = []
+    
+    # Use ThreadPoolExecutor for parallel API calls (max 5 at once to avoid rate limits)
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        # Submit all tasks
+        future_to_row = {
+            executor.submit(classify_single_email, row, JOB_STATUSES): idx 
+            for idx, row in emails_df.iterrows()
+        }
+        
+        # Collect results as they complete
+        completed = 0
+        for future in as_completed(future_to_row):
+            result = future.result()
+            results.append(result)
+            completed += 1
+            
+            if completed % 10 == 0:
+                print(f"Classified {completed}/{len(emails_df)}...")
     
     # Merge classification results with original dataframe
     results_df = pd.DataFrame(results)
     emails_df = emails_df.merge(results_df, on='gmail_id', how='left')
     
     application_count = len(emails_df[emails_df['is_application'] == True])
+    
+    # Count by status
+    status_counts = emails_df[emails_df['is_application'] == True]['application_status'].value_counts()
     print(f"✅ Found {application_count} job applications out of {len(emails_df)} emails")
+    print(f"   📝 Submitted: {status_counts.get('application submitted', 0)}")
+    print(f"   📞 Interviews: {status_counts.get('job interview invitation', 0)}")
+    print(f"   ❌ Rejections: {status_counts.get('job rejection', 0)}")
     
     return emails_df
 
-def extract_job_info(emails_df):
-    """Extract job info using HF NER API for companies and QA API for positions"""
-    print(f"🔍 Extracting job information from {len(emails_df)} emails using HF API...")
+def extract_single_job_info(row):
+    """Extract job info from a single email - helper for parallel processing"""
+    full_text = f"Subject: {row['subject']}\n\n{row['body'][:2000]}"
     
-    results = []
-    for idx, row in emails_df.iterrows():
-        full_text = f"Subject: {row['subject']}\n\n{row['body'][:2000]}"
+    companies = []
+    position = None
+    
+    try:
+        # Step 1: Extract companies using NER
+        ner_response = requests.post(
+            NER_API,
+            headers=HEADERS,
+            json={"inputs": full_text},
+            timeout=60
+        )
         
-        companies = []
-        position = None
-        
-        try:
-            # Step 1: Extract companies using NER
-            ner_response = requests.post(
-                NER_API,
-                headers=HEADERS,
-                json={"inputs": full_text},
-                timeout=60
-            )
-            
-            if ner_response.status_code == 200:
-                entities = ner_response.json()
-                
-                # Parse the NER results - look for ORG entities
+        if ner_response.status_code == 200:
+            entities = ner_response.json()
+            for entity in entities:
+                entity_group = entity.get('entity_group', entity.get('entity', ''))
+                word = entity.get('word', '').strip()
+                if 'ORG' in entity_group and len(word) > 2:
+                    word = word.replace('##', '')
+                    companies.append(word)
+            companies = list(dict.fromkeys([c for c in companies if len(c) > 2]))
+        elif ner_response.status_code == 503:
+            time.sleep(15)
+            retry_ner = requests.post(NER_API, headers=HEADERS, json={"inputs": full_text}, timeout=60)
+            if retry_ner.status_code == 200:
+                entities = retry_ner.json()
                 for entity in entities:
                     entity_group = entity.get('entity_group', entity.get('entity', ''))
                     word = entity.get('word', '').strip()
-                    
-                    # Extract organizations (companies)
                     if 'ORG' in entity_group and len(word) > 2:
-                        # Clean up subword tokens (remove ##)
                         word = word.replace('##', '')
                         companies.append(word)
-                
-                # Clean and deduplicate companies
                 companies = list(dict.fromkeys([c for c in companies if len(c) > 2]))
-                
-            elif ner_response.status_code == 503:
-                print(f"NER model loading, waiting 20s...")
-                time.sleep(20)
-                # Retry once
-                retry_ner = requests.post(NER_API, headers=HEADERS, json={"inputs": full_text}, timeout=60)
-                if retry_ner.status_code == 200:
-                    entities = retry_ner.json()
-                    for entity in entities:
-                        entity_group = entity.get('entity_group', entity.get('entity', ''))
-                        word = entity.get('word', '').strip()
-                        if 'ORG' in entity_group and len(word) > 2:
-                            word = word.replace('##', '')
-                            companies.append(word)
-                    companies = list(dict.fromkeys([c for c in companies if len(c) > 2]))
-            
-            # Step 2: Extract position using Question-Answering
-            qa_response = requests.post(
+        
+        # Step 2: Extract position using Question-Answering
+        qa_response = requests.post(
+            QA_API,
+            headers=HEADERS,
+            json={
+                "inputs": {
+                    "question": "What is the exact job title or position name that was applied for?",
+                    "context": full_text
+                }
+            },
+            timeout=60
+        )
+        
+        if qa_response.status_code == 200:
+            qa_data = qa_response.json()
+            if qa_data.get('score', 0) > 0.1:
+                position = qa_data.get('answer', '').strip()
+                if len(position) < 5 or len(position) > 100:
+                    position = None
+        elif qa_response.status_code == 503:
+            time.sleep(15)
+            retry_qa = requests.post(
                 QA_API,
                 headers=HEADERS,
                 json={
                     "inputs": {
-                        "question": "What job position or role did the applicant apply for?",
+                        "question": "What is the exact job title or position name that was applied for?",
                         "context": full_text
                     }
                 },
                 timeout=60
             )
-            
-            if qa_response.status_code == 200:
-                qa_data = qa_response.json()
-                # QA returns: {"answer": "Software Engineer", "score": 0.95}
-                if qa_data.get('score', 0) > 0.1:  # Only use if confidence > 10%
+            if retry_qa.status_code == 200:
+                qa_data = retry_qa.json()
+                if qa_data.get('score', 0) > 0.1:
                     position = qa_data.get('answer', '').strip()
-                    # Clean up the answer
                     if len(position) < 5 or len(position) > 100:
                         position = None
-                        
-            elif qa_response.status_code == 503:
-                print(f"QA model loading, waiting 20s...")
-                time.sleep(20)
-                # Retry once
-                retry_qa = requests.post(
-                    QA_API,
-                    headers=HEADERS,
-                    json={
-                        "inputs": {
-                            "question": "What job position or role did the applicant apply for?",
-                            "context": full_text
-                        }
-                    },
-                    timeout=60
-                )
-                if retry_qa.status_code == 200:
-                    qa_data = retry_qa.json()
-                    if qa_data.get('score', 0) > 0.1:
-                        position = qa_data.get('answer', '').strip()
-                        if len(position) < 5 or len(position) > 100:
-                            position = None
+        
+        return {
+            'gmail_id': row['gmail_id'],
+            'company': companies[0] if companies else None,
+            'position': position,
+            'all_companies': companies,
+        }
+    except Exception as e:
+        print(f"Error extracting from email: {e}")
+        return {
+            'gmail_id': row['gmail_id'],
+            'company': None,
+            'position': None,
+            'all_companies': [],
+        }
+
+def extract_job_info(emails_df):
+    """Extract job info using HF NER API for companies and QA API for positions with parallel processing"""
+    print(f"🔍 Extracting job information from {len(emails_df)} emails using HF API (parallel)...")
+    
+    results = []
+    
+    # Use ThreadPoolExecutor for parallel API calls (max 5 at once)
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        # Submit all tasks
+        future_to_row = {
+            executor.submit(extract_single_job_info, row): idx 
+            for idx, row in emails_df.iterrows()
+        }
+        
+        # Collect results as they complete
+        completed = 0
+        for future in as_completed(future_to_row):
+            result = future.result()
+            results.append(result)
+            completed += 1
             
-            results.append({
-                'gmail_id': row['gmail_id'],
-                'company': companies[0] if companies else None,
-                'position': position,
-                'all_companies': companies,
-            })
-            
-            if idx % 10 == 0:
-                print(f"Processed {idx}/{len(emails_df)} emails...")
-                
-        except Exception as e:
-            print(f"Error extracting from email: {e}")
-            results.append({
-                'gmail_id': row['gmail_id'],
-                'company': None,
-                'position': None,
-                'all_companies': [],
-            })
+            if completed % 10 == 0:
+                print(f"Processed {completed}/{len(emails_df)} emails...")
     
     # Merge extraction results with original dataframe
     results_df = pd.DataFrame(results)
@@ -597,7 +611,12 @@ def process_emails():
                 'total_emails': len(emails_df),
                 'job_applications': len(job_applications),
                 'companies_found': len(job_applications[job_applications['company'].notna()]) if len(job_applications) > 0 else 0,
-                'positions_found': len(job_applications[job_applications['position'].notna()]) if len(job_applications) > 0 else 0
+                'positions_found': len(job_applications[job_applications['position'].notna()]) if len(job_applications) > 0 else 0,
+                'status_breakdown': {
+                    'submitted': int(len(job_applications[job_applications['application_status'] == 'application submitted'])) if len(job_applications) > 0 else 0,
+                    'interviews': int(len(job_applications[job_applications['application_status'] == 'job interview invitation'])) if len(job_applications) > 0 else 0,
+                    'rejections': int(len(job_applications[job_applications['application_status'] == 'job rejection'])) if len(job_applications) > 0 else 0
+                }
             }
         }
         
@@ -614,6 +633,7 @@ def process_emails():
             'applications': len(job_applications),
             'companies_found': results_data['stats']['companies_found'],
             'positions_found': results_data['stats']['positions_found'],
+            'status_breakdown': results_data['stats']['status_breakdown'],
             'message': f'Found {len(job_applications)} job applications in {len(emails_df)} emails'
         })
         
