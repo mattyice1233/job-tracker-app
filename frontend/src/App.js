@@ -2,8 +2,8 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import './App.css';
 // Detect API URL based on environment
-const API_URL = window.location.hostname === 'localhost' 
-  ? '${API_URL}' 
+const API_URL = window.location.hostname === 'localhost'
+  ? 'http://localhost:5001'
   : window.location.origin;
 function App() {
   const [message, setMessage] = useState('');
@@ -22,7 +22,7 @@ function App() {
   // Check authentication status
   const checkAuthStatus = useCallback(async () => {
     try {
-      const response = await fetch('${API_URL}/auth/status', {
+      const response = await fetch(`${API_URL}/auth/status`, {
         credentials: 'include'
       });
       const data = await response.json();
@@ -41,7 +41,7 @@ function App() {
   const fetchResults = useCallback(async () => {
     try {
       console.log('Fetching results...');
-      const response = await fetch('${API_URL}/api/results', {
+      const response = await fetch(`${API_URL}/api/results`, {
         credentials: 'include'
       });
       
@@ -74,7 +74,7 @@ function App() {
       setLoading(true);
       setMessage('📧 Scanning your emails for job applications...');
       
-      const response = await fetch('${API_URL}/api/process-emails', {
+      const response = await fetch(`${API_URL}/api/process-emails`, {
         credentials: 'include'
       });
       
@@ -101,7 +101,7 @@ function App() {
   const handleGoogleAuth = async () => {
     try {
       setLoading(true);
-      const response = await fetch('${API_URL}/auth/url', {
+      const response = await fetch(`${API_URL}/auth/url`, {
         credentials: 'include'
       });
       const data = await response.json();
@@ -121,7 +121,7 @@ function App() {
   // Clear session
   const clearSession = async () => {
     try {
-      const response = await fetch('${API_URL}/api/clear', {
+      const response = await fetch(`${API_URL}/api/clear`, {
         credentials: 'include'
       });
       const data = await response.json();
