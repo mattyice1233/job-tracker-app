@@ -53,22 +53,27 @@ if not os.path.exists(DATA_DIR):
 HF_TOKEN = os.getenv('HUGGINGFACE_TOKEN')
 HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
-# API URLs for your models
-CLASSIFIER_API = "https://api-inference.huggingface.co/models/Minaides/job-email-classifier"
-NER_API = "https://api-inference.huggingface.co/models/Minaides/job_ner_model"
+# API URLs - Using free public models
+CLASSIFIER_API = "https://api-inference.huggingface.co/models/facebook/bart-large-mnli"
+NER_API = "https://api-inference.huggingface.co/models/dslim/bert-base-NER"
+QA_API = "https://api-inference.huggingface.co/models/deepset/roberta-base-squad2"
 
 def load_models():
     """Initialize - no actual model loading, just verify API access"""
     print("✅ Using Hugging Face Inference API - no local models loaded")
     print(f"📡 Classifier API: {CLASSIFIER_API}")
     print(f"📡 NER API: {NER_API}")
+    print(f"📡 QA API: {QA_API}")
     
     # Test API connectivity
     try:
         test_response = requests.post(
             CLASSIFIER_API, 
             headers=HEADERS, 
-            json={"inputs": "test"}, 
+            json={
+                "inputs": "test",
+                "parameters": {"candidate_labels": ["job application", "other"]}
+            }, 
             timeout=10
         )
         if test_response.status_code == 503:
@@ -188,7 +193,7 @@ def fetch_email(service, msg_id, max_retries=4):
     return None
 
 def classify_emails(emails_df):
-    """Classify emails using HF Inference API"""
+    """Classify emails using HF Zero-Shot Classification API"""
     print(f"📧 Classifying {len(emails_df)} emails using HF API...")
     
     results = []
@@ -196,32 +201,31 @@ def classify_emails(emails_df):
         email_text = f"Subject: {row['subject']}\n\n{row['body'][:1000]}"
         
         try:
-            # Call HF Inference API
+            # Call HF Zero-Shot Classification API
             response = requests.post(
                 CLASSIFIER_API, 
                 headers=HEADERS,
-                json={"inputs": email_text},
+                json={
+                    "inputs": email_text,
+                    "parameters": {
+                        "candidate_labels": ["job application response", "recruitment marketing", "unrelated"]
+                    }
+                },
                 timeout=30
             )
             
             if response.status_code == 200:
                 data = response.json()
                 
-                # Handle different response formats
-                if isinstance(data, list):
-                    # If it's a list of lists (multiple predictions)
-                    if data and isinstance(data[0], list):
-                        classification = data[0][0] if data[0] else {"label": "UNKNOWN", "score": 0.0}
-                    # If it's a list of dicts
-                    else:
-                        classification = data[0] if data else {"label": "UNKNOWN", "score": 0.0}
-                else:
-                    classification = data
+                # Zero-shot classifier returns {'labels': [...], 'scores': [...]}
+                # The first label is the highest confidence prediction
+                is_app = data.get('labels', [''])[0] == "job application response"
+                confidence = data.get('scores', [0.0])[0]
                 
                 results.append({
                     'gmail_id': row['gmail_id'],
-                    'is_application': classification.get('label') == 'JOB_APPLICATION',
-                    'confidence': float(classification.get('score', 0.0))
+                    'is_application': is_app,
+                    'confidence': float(confidence)
                 })
                 
             elif response.status_code == 503:
@@ -232,16 +236,23 @@ def classify_emails(emails_df):
                 retry_response = requests.post(
                     CLASSIFIER_API, 
                     headers=HEADERS,
-                    json={"inputs": email_text},
+                    json={
+                        "inputs": email_text,
+                        "parameters": {
+                            "candidate_labels": ["job application response", "recruitment marketing", "unrelated"]
+                        }
+                    },
                     timeout=30
                 )
                 if retry_response.status_code == 200:
                     data = retry_response.json()
-                    classification = data[0] if isinstance(data, list) and data else data
+                    is_app = data.get('labels', [''])[0] == "job application response"
+                    confidence = data.get('scores', [0.0])[0]
+                    
                     results.append({
                         'gmail_id': row['gmail_id'],
-                        'is_application': classification.get('label') == 'JOB_APPLICATION',
-                        'confidence': float(classification.get('score', 0.0))
+                        'is_application': is_app,
+                        'confidence': float(confidence)
                     })
                 else:
                     results.append({
@@ -278,104 +289,108 @@ def classify_emails(emails_df):
     return emails_df
 
 def extract_job_info(emails_df):
-    """Extract job info using HF Inference API"""
+    """Extract job info using HF NER API for companies and QA API for positions"""
     print(f"🔍 Extracting job information from {len(emails_df)} emails using HF API...")
     
     results = []
     for idx, row in emails_df.iterrows():
         full_text = f"Subject: {row['subject']}\n\n{row['body'][:2000]}"
         
+        companies = []
+        position = None
+        
         try:
-            # Call HF Inference API for NER
-            response = requests.post(
+            # Step 1: Extract companies using NER
+            ner_response = requests.post(
                 NER_API,
                 headers=HEADERS,
                 json={"inputs": full_text},
                 timeout=60
             )
             
-            if response.status_code == 200:
-                entities = response.json()
+            if ner_response.status_code == 200:
+                entities = ner_response.json()
                 
-                companies = []
-                positions = []
-                
-                # Parse the NER results
+                # Parse the NER results - look for ORG entities
                 for entity in entities:
-                    entity_group = entity.get('entity_group', '')
+                    entity_group = entity.get('entity_group', entity.get('entity', ''))
                     word = entity.get('word', '').strip()
                     
-                    # Handle both B-/I- prefixed and plain labels
-                    if 'COMPANY' in entity_group:
+                    # Extract organizations (companies)
+                    if 'ORG' in entity_group and len(word) > 2:
+                        # Clean up subword tokens (remove ##)
+                        word = word.replace('##', '')
                         companies.append(word)
-                    elif 'POSITION' in entity_group:
-                        positions.append(word)
                 
-                # Clean and deduplicate
+                # Clean and deduplicate companies
                 companies = list(dict.fromkeys([c for c in companies if len(c) > 2]))
-                positions = list(dict.fromkeys([p for p in positions if len(p) > 2]))
                 
-                results.append({
-                    'gmail_id': row['gmail_id'],
-                    'company': companies[0] if companies else None,
-                    'position': positions[0] if positions else None,
-                    'all_companies': companies,
-                    'all_positions': positions
-                })
-                
-            elif response.status_code == 503:
-                # Model is loading
-                print(f"NER model loading, waiting 30s...")
-                time.sleep(30)
+            elif ner_response.status_code == 503:
+                print(f"NER model loading, waiting 20s...")
+                time.sleep(20)
                 # Retry once
-                retry_response = requests.post(
-                    NER_API,
+                retry_ner = requests.post(NER_API, headers=HEADERS, json={"inputs": full_text}, timeout=60)
+                if retry_ner.status_code == 200:
+                    entities = retry_ner.json()
+                    for entity in entities:
+                        entity_group = entity.get('entity_group', entity.get('entity', ''))
+                        word = entity.get('word', '').strip()
+                        if 'ORG' in entity_group and len(word) > 2:
+                            word = word.replace('##', '')
+                            companies.append(word)
+                    companies = list(dict.fromkeys([c for c in companies if len(c) > 2]))
+            
+            # Step 2: Extract position using Question-Answering
+            qa_response = requests.post(
+                QA_API,
+                headers=HEADERS,
+                json={
+                    "inputs": {
+                        "question": "What job position or role did the applicant apply for?",
+                        "context": full_text
+                    }
+                },
+                timeout=60
+            )
+            
+            if qa_response.status_code == 200:
+                qa_data = qa_response.json()
+                # QA returns: {"answer": "Software Engineer", "score": 0.95}
+                if qa_data.get('score', 0) > 0.1:  # Only use if confidence > 10%
+                    position = qa_data.get('answer', '').strip()
+                    # Clean up the answer
+                    if len(position) < 5 or len(position) > 100:
+                        position = None
+                        
+            elif qa_response.status_code == 503:
+                print(f"QA model loading, waiting 20s...")
+                time.sleep(20)
+                # Retry once
+                retry_qa = requests.post(
+                    QA_API,
                     headers=HEADERS,
-                    json={"inputs": full_text},
+                    json={
+                        "inputs": {
+                            "question": "What job position or role did the applicant apply for?",
+                            "context": full_text
+                        }
+                    },
                     timeout=60
                 )
-                if retry_response.status_code == 200:
-                    entities = retry_response.json()
-                    companies = []
-                    positions = []
-                    
-                    for entity in entities:
-                        entity_group = entity.get('entity_group', '')
-                        word = entity.get('word', '').strip()
-                        
-                        if 'COMPANY' in entity_group:
-                            companies.append(word)
-                        elif 'POSITION' in entity_group:
-                            positions.append(word)
-                    
-                    companies = list(dict.fromkeys([c for c in companies if len(c) > 2]))
-                    positions = list(dict.fromkeys([p for p in positions if len(p) > 2]))
-                    
-                    results.append({
-                        'gmail_id': row['gmail_id'],
-                        'company': companies[0] if companies else None,
-                        'position': positions[0] if positions else None,
-                        'all_companies': companies,
-                        'all_positions': positions
-                    })
-                else:
-                    results.append({
-                        'gmail_id': row['gmail_id'],
-                        'company': None,
-                        'position': None,
-                        'all_companies': [],
-                        'all_positions': []
-                    })
-            else:
-                print(f"NER API error {response.status_code}")
-                results.append({
-                    'gmail_id': row['gmail_id'],
-                    'company': None,
-                    'position': None,
-                    'all_companies': [],
-                    'all_positions': []
-                })
-                
+                if retry_qa.status_code == 200:
+                    qa_data = retry_qa.json()
+                    if qa_data.get('score', 0) > 0.1:
+                        position = qa_data.get('answer', '').strip()
+                        if len(position) < 5 or len(position) > 100:
+                            position = None
+            
+            results.append({
+                'gmail_id': row['gmail_id'],
+                'company': companies[0] if companies else None,
+                'position': position,
+                'all_companies': companies,
+            })
+            
             if idx % 10 == 0:
                 print(f"Processed {idx}/{len(emails_df)} emails...")
                 
@@ -386,7 +401,6 @@ def extract_job_info(emails_df):
                 'company': None,
                 'position': None,
                 'all_companies': [],
-                'all_positions': []
             })
     
     # Merge extraction results with original dataframe
@@ -647,8 +661,6 @@ def clear_session():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-if __name__ == '__main__':
-    app.run(debug=True, port=int(os.getenv('PORT', 5001)))
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5001))
     if os.getenv('RENDER'):
