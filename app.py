@@ -680,7 +680,16 @@ def clear_session():
         return jsonify({'message': 'Session and data cleared'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
+#temporary for testing
+@app.route('/export-credentials')
+def export_credentials():
+    """Temporary route to export credentials for testing"""
+    if 'credentials' in session:
+        creds = session['credentials']
+        with open('credentials.json', 'w') as f:
+            json.dump(creds, f)
+        return jsonify({'message': 'Credentials saved to credentials.json'})
+    return jsonify({'error': 'Not authenticated'}), 401
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5001))
     if os.getenv('RENDER'):
