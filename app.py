@@ -683,13 +683,18 @@ def clear_session():
 #temporary for testing
 @app.route('/export-credentials')
 def export_credentials():
-    """Temporary route to export credentials for testing"""
+    """Export credentials for local testing"""
     if 'credentials' in session:
+        from flask import Response
         creds = session['credentials']
-        with open('credentials.json', 'w') as f:
-            json.dump(creds, f)
-        return jsonify({'message': 'Credentials saved to credentials.json'})
-    return jsonify({'error': 'Not authenticated'}), 401
+        
+        # Return as downloadable JSON file
+        return Response(
+            json.dumps(creds, indent=2),
+            mimetype='application/json',
+            headers={'Content-Disposition': 'attachment; filename=credentials.json'}
+        )
+    return jsonify({'error': 'Not authenticated. Please log in first.'}), 401
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5001))
     if os.getenv('RENDER'):
